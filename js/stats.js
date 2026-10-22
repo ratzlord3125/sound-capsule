@@ -23,11 +23,34 @@ export function yearsIn(records) {
   return [...years].sort((a, b) => b - a);
 }
 
+// Calendar months with music plays, newest first, as "YYYY-MM".
+export function monthsIn(records) {
+  const months = new Set();
+  for (const r of records) {
+    if (r.type !== "music") continue;
+    const d = new Date(r.t);
+    months.add(`${d.getFullYear()}-${pad(d.getMonth() + 1)}`);
+  }
+  return [...months].sort().reverse();
+}
+
+export const isMonthId = (id) => /^\d{4}-\d{2}$/.test(id);
+export const isYearId = (id) => /^\d{4}$/.test(id);
+
 // Windows are anchored on the most recent record, since exports are always a little stale.
 export function windowFor(rangeId, records) {
   if (!records.length) return { start: 0, end: 0, label: "" };
   const last = records[records.length - 1].t;
-  if (/^\d{4}$/.test(rangeId)) {
+  if (isMonthId(rangeId)) {
+    const [y, m] = rangeId.split("-").map(Number);
+    const first = new Date(y, m - 1, 1);
+    return {
+      start: first.getTime(),
+      end: new Date(y, m, 1).getTime() - 1,
+      label: first.toLocaleDateString(undefined, { month: "long", year: "numeric" }),
+    };
+  }
+  if (isYearId(rangeId)) {
     const y = Number(rangeId);
     return { start: new Date(y, 0, 1).getTime(), end: new Date(y + 1, 0, 1).getTime() - 1, label: String(y) };
   }
@@ -168,6 +191,19 @@ export function computeStats(records, { start, end }) {
   const peakWeekday = weekdays.indexOf(Math.max(...weekdays));
   const monthList = [...months.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([key, v]) => ({ key, ms: v }));
 
+  // Continuous per-day series for short windows (a month, 4 weeks), including silent days.
+  let byDay = null;
+  if (end - start <= 62 * DAY) {
+    byDay = [];
+    const cursor = new Date(start);
+    cursor.setHours(0, 0, 0, 0);
+    while (cursor.getTime() <= end) {
+      const k = dayKey(cursor);
+      byDay.push({ key: k, ms: days.get(k) || 0 });
+      cursor.setDate(cursor.getDate() + 1);
+    }
+  }
+
   return {
     start,
     end,
@@ -193,6 +229,7 @@ export function computeStats(records, { start, end }) {
     byHour: hours,
     byWeekday: weekdays,
     byMonth: monthList,
+    byDay,
     peakHour,
     peakWeekday,
     avgPerActiveDay: activeDays.length ? Math.round(ms / 60000 / activeDays.length) : 0,

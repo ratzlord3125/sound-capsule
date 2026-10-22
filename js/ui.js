@@ -24,7 +24,12 @@ export const monthLabel = (key) => {
   return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "short", year: "2-digit" });
 };
 
-export const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+export const monthName = (key) => {
+  const [y, m] = key.split("-").map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+};
+
+export const WEEKDAYS =["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 export const hourLabel = (h) => `${((h + 11) % 12) + 1}${h < 12 ? "am" : "pm"}`;
 
@@ -43,7 +48,8 @@ export function art(src, name, cls = "art", round = false) {
   return `<div class="${cls} placeholder${round ? " round" : ""}">${esc(initials(name))}</div>`;
 }
 
-export function artistGrid(items, { limit = 10, valueOf } = {}) {
+// Option names deliberately avoid Object.prototype members such as valueOf.
+export function artistGrid(items, { limit = 10, valueText } = {}) {
   if (!items?.length) return `<p class="empty">Nothing here yet.</p>`;
   return `<ol class="artist-grid">${items
     .slice(0, limit)
@@ -53,13 +59,13 @@ export function artistGrid(items, { limit = 10, valueOf } = {}) {
         ${art(a.image, a.name, "art")}
         <div class="rank">#${i + 1}</div>
         <div class="name" title="${esc(a.name)}">${esc(a.name)}</div>
-        ${valueOf ? `<div class="meta">${esc(valueOf(a))}</div>` : a.genres?.length ? `<div class="meta">${esc(a.genres[0])}</div>` : ""}
+        ${valueText ? `<div class="meta">${esc(valueText(a))}</div>` : a.genres?.length ? `<div class="meta">${esc(a.genres[0])}</div>` : ""}
       </li>`,
     )
     .join("")}</ol>`;
 }
 
-export function trackList(items, { limit = 10, valueOf, round = false, subOf } = {}) {
+export function trackList(items, { limit = 10, valueText, round = false, subText } = {}) {
   if (!items?.length) return `<p class="empty">Nothing here yet.</p>`;
   return `<ol class="track-list">${items
     .slice(0, limit)
@@ -70,9 +76,9 @@ export function trackList(items, { limit = 10, valueOf, round = false, subOf } =
         ${art(t.image, t.name, "art", round)}
         <div class="text">
           <div class="name" title="${esc(t.name)}">${esc(t.name)}</div>
-          <div class="meta">${esc(subOf ? subOf(t) : t.artist || "")}</div>
+          <div class="meta">${esc(subText ? subText(t) : t.artist || "")}</div>
         </div>
-        <span class="value">${valueOf ? esc(valueOf(t)) : ""}</span>
+        <span class="value">${valueText ? esc(valueText(t)) : ""}</span>
       </li>`,
     )
     .join("")}</ol>`;

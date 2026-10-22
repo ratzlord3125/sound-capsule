@@ -62,9 +62,14 @@ export async function api(path, params = {}, { ttl = HOUR, retry = 1 } = {}) {
         : `Forbidden (403). ${body}`,
     );
   }
+  if (response.status >= 500 && retry > 0) {
+    await new Promise((r) => setTimeout(r, 1500));
+    return api(path, params, { ttl, retry: retry - 1 });
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    throw new Error(body.error?.message || `Spotify API error ${response.status}`);
+    const detail = typeof body.error === "string" ? body.error : body.error?.message || "";
+    throw new Error(`Spotify returned ${response.status} for ${path}${detail ? `: ${detail}` : ""}`);
   }
   const json = response.status === 204 ? null : await response.json();
   if (ttl > 0 && json) cacheSet(url, json, ttl);
@@ -97,7 +102,7 @@ export const slimArtist = (a) => ({
 export const slimTrack = (t) => ({
   id: t.id,
   name: t.name,
-  artists: t.artists.map((a) => ({ id: a.id, name: a.name })),
+  artists: (t.artists || []).map((a) => ({ id: a.id, name: a.name })),
   album: t.album?.name,
   image: smallestImage(t.album?.images),
   url: t.external_urls?.spotify,
