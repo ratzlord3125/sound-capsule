@@ -860,12 +860,23 @@ img {
 }
 
 .dropzone {
+  /* a <label>, so it must be made block-level or its border fragments around the lines */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   border: 2px dashed rgba(255, 255, 255, 0.18);
   border-radius: var(--radius);
   padding: 40px 24px;
   text-align: center;
   background: var(--surface);
+  cursor: pointer;
   transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.dropzone:hover {
+  border-color: rgba(255, 255, 255, 0.35);
 }
 
 .dropzone.drag {
@@ -889,8 +900,8 @@ img {
 }
 
 .dropzone.compact {
-  padding: 18px;
-  display: flex;
+  padding: 18px 22px;
+  flex-direction: row;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
