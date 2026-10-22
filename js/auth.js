@@ -112,6 +112,7 @@ export async function handleRedirect() {
     code,
     redirect_uri: cleanUrl,
     client_id: getClientId(),
+    code_verifier: verifier,
   });
   return true;
 }
