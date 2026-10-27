@@ -2,9 +2,10 @@ import { getClientId, setClientId, redirectUri } from "./config.js";
 import { login, logout, isLoggedIn, handleRedirect, AuthError } from "./auth.js";
 import { getMe, getTop, getRecentlyPlayed, getTracks, getArtists, slimArtist, slimTrack, trackIdFromUri, clearCache } from "./api.js";
 import { loadStoredHistory, clearStoredHistory, parseFiles, addToHistory } from "./history.js";
-import { RANGES, yearsIn, monthsIn, isMonthId, isYearId, windowFor, computeStats, listenerType, genreBreakdown } from "./stats.js";
-import { esc, fmt, fmtMinutes, fmtDate, monthLabel, monthName, WEEKDAYS, hourLabel, artistGrid, trackList, genreBars, columns, capsuleCard, toast } from "./ui.js";
+import { RANGES, yearsIn, monthsIn, isMonthId, isYearId, windowFor, computeStats, listenerType, genreBreakdown, tempoSummary, monthlyTempo } from "./stats.js";
+import { esc, fmt, fmtMinutes, fmtDate, monthLabel, monthName, WEEKDAYS, hourLabel, artistGrid, trackList, genreBars, columns, capsuleCard, heatmap, lineChart, dayTable, toast } from "./ui.js";
 import { shareCard } from "./share.js";
+import { lookupTempos, hasUnresolvedMisses } from "./tempo.js";
 
 const LIVE_RANGES = [
   { id: "short_term", label: "Last 4 weeks" },
@@ -23,6 +24,8 @@ const state = {
   histRange: localStorage.getItem("sc_hist_range") || "4w",
   stats: null,
   enriched: null, // { artists: Map name->slim, tracks: Map id->slim }
+  tempo: {}, // histRange -> tempo summary
+  tempoLoading: false,
   busy: false,
   settingsOpen: false,
 };
@@ -273,6 +276,7 @@ async function loadLive(rangeId) {
     .map(slimTrack)
     .map((t) => ({ ...t, artist: t.artists.map((a) => a.name).join(", ") }));
   state.live[rangeId] = { artists, tracks, genres: genreBreakdown(artists, 8), errors: failures.map((e) => e.message) };
+  loadLiveTempo(rangeId);
   if (!state.recent) {
     getRecentlyPlayed(50)
       .then((r) => {
@@ -290,7 +294,7 @@ async function loadLive(rangeId) {
   }
 }
 
-function liveContent(range, { artists, tracks, genres, errors }) {
+function liveContent(range, { artists, tracks, genres, errors, tempo, tempoLoading }) {
   const theme = THEMES[LIVE_RANGES.indexOf(range) % THEMES.length];
   const top = artists[0];
   const topTrack = tracks[0];
@@ -299,6 +303,14 @@ function liveContent(range, { artists, tracks, genres, errors }) {
     ? recent.map((i) => ({ ...slimTrack(i.track), artist: i.track.artists.map((a) => a.name).join(", "), played_at: i.played_at }))
     : null;
   const recentArtists = recentTracks ? new Set(recentTracks.map((t) => t.artists[0]?.id)).size : 0;
+  const topGenre = genres[0] ? titleCase(genres[0].name) : null;
+  const albums = albumsFromTracks(tracks);
+  const topAlbum = albums[0] || null;
+  const stat = topGenre
+    ? { value: topGenre, label: "your top genre", text: true }
+    : topAlbum
+      ? { value: topAlbum.name, label: "your top album", text: true }
+      : null;
 
   return `
   ${errors?.length ? `<p class="notice">Part of your capsule could not be loaded. ${esc(errors.join(" "))}</p>` : ""}
@@ -310,7 +322,7 @@ function liveContent(range, { artists, tracks, genres, errors }) {
           theme,
           eyebrow: range.label,
           title: "Your Sound Capsule",
-          stat: genres[0] ? { value: titleCase(genres[0].name), label: "your top genre" } : null,
+          stat,
           artist: top ? { name: top.name, image: top.image, sub: top.genres.slice(0, 2).join(" · ") } : null,
           track: topTrack ? { name: topTrack.name, image: topTrack.image, sub: topTrack.artist } : null,
           artists: artists.map((a) => a.name),
@@ -322,10 +334,14 @@ function liveContent(range, { artists, tracks, genres, errors }) {
     </div>
     <div class="col-8">
       <div class="tiles">
-        <div class="tile"><div class="value">${esc(top?.name || "–")}</div><div class="label">Top artist</div></div>
-        <div class="tile"><div class="value">${esc(topTrack?.name || "–")}</div><div class="label">Top song</div></div>
-        <div class="tile"><div class="value">${genres[0] ? esc(titleCase(genres[0].name)) : "–"}</div><div class="label">Top genre</div></div>
-        <div class="tile"><div class="value">${recentTracks ? recentArtists : "…"}</div><div class="label">Artists in your last 50 plays</div></div>
+        ${tile(top?.name || "–", "Top artist", top?.genres?.[0] ? titleCase(top.genres[0]) : "", { text: true })}
+        ${tile(topTrack?.name || "–", "Top song", topTrack?.artist || "", { text: true })}
+        ${
+          topGenre
+            ? tile(topGenre, "Top genre", "", { text: true })
+            : tile(topAlbum?.name || "–", "Top album", topAlbum ? `${topAlbum.count} of your top ${tracks.length} songs` : "", { text: true })
+        }
+        ${tile(recentTracks ? recentArtists : "…", "Artists in your last 50 plays", recentTracks ? `${recentTracks.length} plays loaded` : "")}
       </div>
       <section class="card">
         <h2>Top artists <small>${esc(range.label.toLowerCase())}</small></h2>
@@ -336,15 +352,154 @@ function liveContent(range, { artists, tracks, genres, errors }) {
       <h2>Top songs <small>${esc(range.label.toLowerCase())}</small></h2>
       ${trackList(tracks, { limit: 10 })}
     </section>
-    <section class="card col-6">
+    ${
+      genres.length
+        ? `<section class="card col-6">
       <h2>Top genres <small>weighted across your top 50 artists</small></h2>
       ${genreBars(genres)}
-    </section>
-    <section class="card col-12">
+    </section>`
+        : `<section class="card col-6">
+      <h2>Top albums <small>from your top ${tracks.length} songs</small></h2>
+      ${trackList(albums, { limit: 10, subText: (a) => a.artist, valueText: (a) => `${a.count} song${a.count === 1 ? "" : "s"}` })}
+      <p class="sources">Spotify's API no longer returns genre tags for most artists, so albums are shown instead.</p>
+    </section>`
+    }
+    ${tempoCard(tempo, { loading: tempoLoading, periodLabel: `your top ${tracks.length} songs, ${range.label.toLowerCase()}` })}
+    <section class="card col-6">
       <h2>Recently played <small>your last 50 plays, the most the API exposes</small></h2>
       ${recentTracks ? trackList(recentTracks, { limit: 12, valueText: (t) => relTime(t.played_at) }) : `<p class="empty"><span class="spinner"></span></p>`}
     </section>
   </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Tempo (BPM)
+
+function patchTempoProgress(message) {
+  const el = document.getElementById("tempo-progress");
+  if (el) el.textContent = message;
+}
+
+// Swap the rendered tempo card for its loading state without re-rendering the whole view.
+function showTempoLoading(periodLabel) {
+  const el = document.getElementById("tempo-card");
+  if (el) el.outerHTML = tempoCard(null, { loading: true, periodLabel });
+}
+
+function tempoCard(summary, { loading, periodLabel }) {
+  const open = `<section class="card col-6" id="tempo-card">`;
+  const head = `<h2>Tempo <small>${esc(periodLabel)}</small></h2>`;
+  if (!summary && loading) {
+    return `${open}${head}<p class="empty"><span class="spinner"></span> <span id="tempo-progress">Looking up tempo…</span></p></section>`;
+  }
+  if (!summary) return `${open}${head}<p class="empty">Tempo will load in a moment.</p></section>`;
+  if (summary.error) return `${open}${head}<p class="empty">${esc(summary.error)}</p></section>`;
+  if (!summary.avg) {
+    return `${open}${head}<p class="empty">No tempo data was found for these songs.${summary.hint ? ` ${esc(summary.hint)}` : ""}</p></section>`;
+  }
+
+  const avgIdx = Math.min(summary.histogram.length - 1, Math.max(0, Math.floor((summary.avg - 60) / 10)));
+  const totalWeight = summary.histogram.reduce((a, b) => a + b.weight, 0) || 1;
+  const picks = [
+    { ...summary.fastest, tag: "Fastest" },
+    { ...summary.slowest, tag: "Slowest" },
+  ].filter((p) => p.id);
+  const monthly = summary.monthly?.length >= 3 ? summary.monthly.map((m) => ({ label: monthLabel(m.key), value: m.bpm })) : null;
+  return `${open}
+    ${head}
+    <div class="tempo-head">
+      <div class="tempo-avg"><div class="n">${Math.round(summary.avg)}</div><div class="l">average BPM, weighted by how much you played each song</div></div>
+      <div class="tempo-cover">Based on ${fmt(summary.matchedCount)} of ${fmt(summary.total)} songs, covering ${Math.round(summary.coverage * 100)}% of your listening</div>
+    </div>
+    ${columns(
+      summary.histogram.map((b) => b.weight),
+      {
+        peak: avgIdx,
+        tip: (i) => `${summary.histogram[i].from}–${summary.histogram[i].to} BPM · ${Math.round((summary.histogram[i].weight / totalWeight) * 100)}% · ${summary.histogram[i].count} song${summary.histogram[i].count === 1 ? "" : "s"}`,
+        labels: ["60", "100", "140", "180+"],
+      },
+    )}
+    <div style="height:14px"></div>
+    ${trackList(picks, { limit: 2, valueText: (t) => `${Math.round(t.tempo)} BPM`, subText: (t) => `${t.tag} · ${t.artist}` })}
+    ${monthly ? `<div style="height:14px"></div>${lineChart(monthly, { format: (v) => `${Math.round(v)} BPM` })}` : ""}
+    <p class="sources">Tempo from ReccoBeats, with Deezer as a fallback. Spotify's API no longer provides it.${summary.hint ? ` ${esc(summary.hint)}` : ""}</p>
+  </section>`;
+}
+
+async function loadLiveTempo(rangeId) {
+  const data = state.live[rangeId];
+  if (!data || data.tempo || data.tempoLoading || !data.tracks.length) return;
+  data.tempoLoading = true;
+  const range = LIVE_RANGES.find((r) => r.id === rangeId) || LIVE_RANGES[0];
+  showTempoLoading(`your top ${data.tracks.length} songs, ${range.label.toLowerCase()}`);
+  const items = data.tracks.map((t, i) => ({
+    id: t.id,
+    name: t.name,
+    artist: t.artists[0]?.name || t.artist,
+    isrc: t.isrc,
+    image: t.image,
+    weight: data.tracks.length - i,
+    plays: 1,
+  }));
+  try {
+    const tempos = await lookupTempos(items, { loggedIn: true, onProgress: patchTempoProgress, fallbackLimit: 15 });
+    data.tempo = tempoSummary(
+      items.map((it) => ({ ...it, tempo: tempos.get(it.id) })),
+      { minPlays: 1 },
+    );
+  } catch (e) {
+    console.warn(e);
+    data.tempo = { error: "Tempo lookup failed. Reload the page to try again." };
+  } finally {
+    data.tempoLoading = false;
+    if (state.view === "capsule" && state.liveRange === rangeId) render();
+  }
+}
+
+async function loadHistoryTempo() {
+  const key = state.histRange;
+  const s = state.stats;
+  const records = state.history.records;
+  if (!s || state.tempo[key] || state.tempoLoading) return;
+  const pool = s.allTracks.filter((t) => t.uri).slice(0, 300);
+  if (!pool.length) {
+    state.tempo[key] = { avg: null, matchedCount: 0, total: 0, coverage: 0, histogram: [] };
+    return;
+  }
+  state.tempoLoading = true;
+  showTempoLoading(`up to 300 most-played songs, ${windowFor(key, records).label.toLowerCase()}`);
+  try {
+    const items = pool.map((t) => {
+      const id = trackIdFromUri(t.uri);
+      return { id, name: t.name, artist: t.artist, weight: t.ms, plays: t.plays, image: state.enriched?.tracks.get(id)?.image || null };
+    });
+    const tempos = await lookupTempos(items, { loggedIn: isLoggedIn(), onProgress: patchTempoProgress, fallbackLimit: 25 });
+    const totalWeight = s.allTracks.reduce((a, t) => a + t.ms, 0);
+    const summary = tempoSummary(
+      items.map((it) => ({ ...it, tempo: tempos.get(it.id) })),
+      { minPlays: 3, totalWeight },
+    );
+    summary.monthly = monthlyTempo(records, tempos, { start: s.start, end: s.end });
+    if (!isLoggedIn() && (await hasUnresolvedMisses(items.map((it) => it.id)))) {
+      summary.hint = "Sign in with Spotify to look up the songs ReccoBeats did not know.";
+    }
+    if (isLoggedIn() && summary.fastest) {
+      try {
+        const imgs = await getTracks([summary.fastest.id, summary.slowest.id]);
+        summary.fastest.image = imgs.get(summary.fastest.id)?.image || summary.fastest.image;
+        summary.slowest.image = imgs.get(summary.slowest.id)?.image || summary.slowest.image;
+      } catch {
+        // artwork is optional
+      }
+    }
+    if (state.history.records === records) state.tempo[key] = summary;
+  } catch (e) {
+    console.warn(e);
+    state.tempo[key] = { error: "Tempo lookup failed. Reload the page to try again." };
+  } finally {
+    state.tempoLoading = false;
+    if (state.view === "history") render();
+  }
 }
 
 function bindLive() {
@@ -390,6 +545,7 @@ function renderHistoryView() {
   const win = windowFor(state.histRange, records);
   const s = state.stats;
   const enr = state.enriched;
+  const tempo = state.tempo[state.histRange];
   const themeIndex = isMonthId(state.histRange)
     ? Number(state.histRange.slice(5))
     : isYearId(state.histRange)
@@ -429,9 +585,11 @@ function renderHistoryView() {
       ${tile(fmt(s.minutes), "minutes listened", s.hours ? `${fmt(s.hours)} hours` : "")}
       ${tile(fmt(s.streams), "songs played", `${fmt(s.trackCount)} different songs`)}
       ${tile(fmt(s.artistCount), "artists", `${fmt(s.discoveryCount)} discovered for the first time`)}
-      ${tile(fmt(s.activeDays), "days with music", `${fmt(s.avgPerActiveDay)} min on an average day`)}
+      ${tile(fmt(s.avgPerDay), "minutes per day", `${fmt(s.avgPerActiveDay)} on days you listened`)}
+      ${tile(fmt(s.activeDays), "days with music", `of ${fmt(s.calendarDays)} days in this period`)}
       ${tile(`${s.streak.longest}`, "day streak", s.streak.current > 1 ? `${s.streak.current} days running at the end` : "longest run in this period")}
       ${s.topDay ? tile(fmt(s.topDay.minutes), "minutes on your biggest day", fmtDate(s.topDay.date + "T12:00:00")) : ""}
+      ${tempo?.avg ? tile(fmt(tempo.avg), "average BPM", tempo.fastest ? `fastest: ${tempo.fastest.name}` : "") : ""}
     </div>
 
     <div class="grid">
@@ -492,6 +650,21 @@ function renderHistoryView() {
         ${columns(s.byWeekday, { peak: s.peakWeekday, tip: (i, v) => `${WEEKDAYS[i]} · ${fmt(v / 60000)} min`, labels: WEEKDAYS })}
       </section>
 
+      <section class="card col-6">
+        <h2>Biggest days <small>top 10 by minutes</small></h2>
+        ${dayTable(s.biggestDays)}
+      </section>
+      ${tempoCard(tempo, { loading: state.tempoLoading, periodLabel: `up to 300 most-played songs, ${periodLabel.toLowerCase()}` })}
+
+      ${
+        s.byDay
+          ? ""
+          : `<section class="card col-12">
+        <h2>Every day <small>${esc(periodLabel)} · darker means more minutes</small></h2>
+        ${heatmap(s.dayTotals, s.start, s.end)}
+      </section>`
+      }
+
       <section class="card col-12">
         <h2>${s.byDay ? "Day by day" : "Month by month"} <small>${esc(periodLabel)}</small></h2>
         ${s.byDay ? dayChart(s.byDay) : monthChart(s.byMonth)}
@@ -522,15 +695,32 @@ function renderHistoryView() {
     state.history = { records: [], meta: { sources: [] } };
     state.stats = null;
     state.enriched = null;
+    state.tempo = {};
     render();
   });
   bindDropzone(main);
   bindShare(main);
   if (isLoggedIn() && !enr && !state.busy) enrichHistory();
+  if (!tempo && !state.tempoLoading) loadHistoryTempo();
 }
 
-const tile = (value, label, sub) =>
-  `<div class="tile"><div class="value">${value}</div><div class="label">${esc(label)}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ""}</div>`;
+// `value` is pre-formatted HTML for numbers; pass text: true for names so they wrap and clamp.
+const tile = (value, label, sub, { text = false } = {}) =>
+  `<div class="tile"><div class="value${text ? " text" : ""}"${text ? ` title="${esc(value)}"` : ""}>${text ? esc(value) : value}</div><div class="label">${esc(label)}</div>${sub ? `<div class="sub">${esc(sub)}</div>` : ""}</div>`;
+
+// Group the top 50 songs by album; the album with the most entries wins, ties go to the higher-ranked one.
+function albumsFromTracks(tracks) {
+  const map = new Map();
+  tracks.forEach((t, i) => {
+    if (!t.album) return;
+    const artist = t.artists[0]?.name || t.artist || "";
+    const key = `${artist}|${t.album}`;
+    const entry = map.get(key) || { name: t.album, artist, image: t.image, url: t.url, count: 0, rank: i };
+    entry.count++;
+    map.set(key, entry);
+  });
+  return [...map.values()].sort((a, b) => b.count - a.count || a.rank - b.rank);
+}
 
 function milestones(list) {
   if (!list.length) return `<p class="empty">No milestones in this period. Keep listening.</p>`;
@@ -622,6 +812,7 @@ async function importFiles(files) {
     const result = await addToHistory(parsed.records, parsed.sources);
     state.history = { records: result.records, meta: result.meta };
     state.enriched = null;
+    state.tempo = {};
     recomputeStats();
     toast(`Imported ${fmt(result.added)} plays${result.duplicates ? ` (${fmt(result.duplicates)} duplicates skipped)` : ""}.`);
     state.view = "history";

@@ -107,6 +107,7 @@ export const slimTrack = (t) => ({
   image: smallestImage(t.album?.images),
   url: t.external_urls?.spotify,
   duration_ms: t.duration_ms,
+  isrc: t.external_ids?.isrc || null,
 });
 
 async function batchLookup(kind, ids, slim) {

@@ -56,9 +56,15 @@ export function windowFor(rangeId, records) {
   }
   const range = RANGES.find((r) => r.id === rangeId) || RANGES[0];
   const end = last;
-  const start = range.days ? end - range.days * DAY : 0;
+  const start = range.days ? end - range.days * DAY : records[0].t;
   return { start, end, label: range.label };
 }
+
+const startOfDay = (t) => {
+  const d = new Date(t);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+};
 
 function bump(map, key, rec, meta) {
   let e = map.get(key);
@@ -95,6 +101,8 @@ export function computeStats(records, { start, end }) {
   const hours = new Array(24).fill(0);
   const weekdays = new Array(7).fill(0);
   const days = new Map();
+  const dayPlays = new Map();
+  const dayTracks = new Map(); // dayKey -> Map(trackKey -> ms), for each day's top song
   const months = new Map();
   const artistFirst = new Map(); // artist -> first play ever (before or inside window)
   const artistBefore = new Map(); // all-time artist ms before window
@@ -139,6 +147,13 @@ export function computeStats(records, { start, end }) {
     weekdays[d.getDay()] += rec.ms;
     const dk = dayKey(d);
     days.set(dk, (days.get(dk) || 0) + rec.ms);
+    if (isStream) dayPlays.set(dk, (dayPlays.get(dk) || 0) + 1);
+    let dt = dayTracks.get(dk);
+    if (!dt) {
+      dt = new Map();
+      dayTracks.set(dk, dt);
+    }
+    dt.set(trackKey, (dt.get(trackKey) || 0) + rec.ms);
     const mk = dk.slice(0, 7);
     months.set(mk, (months.get(mk) || 0) + rec.ms);
 
@@ -186,7 +201,21 @@ export function computeStats(records, { start, end }) {
   milestones.sort((a, b) => b.ms - a.ms);
 
   const activeDays = [...days.entries()].filter(([, v]) => v >= STREAM_MS).map(([k]) => k);
-  const topDayEntry = [...days.entries()].sort((a, b) => b[1] - a[1])[0] || null;
+  const daysDesc = [...days.entries()].sort((a, b) => b[1] - a[1]);
+  const topDayEntry = daysDesc[0] || null;
+  const calendarDays = Math.max(1, Math.floor((end - startOfDay(start)) / DAY) + 1);
+  const biggestDays = daysDesc.slice(0, 10).map(([k, v]) => {
+    let best = null;
+    for (const [tk, tms] of dayTracks.get(k)) if (!best || tms > best.ms) best = { key: tk, ms: tms };
+    const tr = best ? tracks.get(best.key) : null;
+    return {
+      date: k,
+      minutes: Math.round(v / 60000),
+      plays: dayPlays.get(k) || 0,
+      topTrack: tr ? { name: tr.name, artist: tr.artist, uri: tr.uri, minutes: Math.round(best.ms / 60000) } : null,
+    };
+  });
+  const allTracks = [...tracks.values()].sort((a, b) => b.ms - a.ms);
   const peakHour = hours.indexOf(Math.max(...hours));
   const peakWeekday = weekdays.indexOf(Math.max(...weekdays));
   const monthList = [...months.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([key, v]) => ({ key, ms: v }));
@@ -218,12 +247,17 @@ export function computeStats(records, { start, end }) {
     trackCount: tracks.size,
     albumCount: albums.size,
     topArtists: sortedTop(artists, 50),
-    topTracks: sortedTop(tracks, 50),
+    topTracks: allTracks.slice(0, 50),
+    allTracks,
     topAlbums: sortedTop(albums, 20),
     discoveries,
     discoveryCount: discoveries.length,
     milestones,
     activeDays: activeDays.length,
+    calendarDays,
+    avgPerDay: Math.round(ms / 60000 / calendarDays),
+    biggestDays,
+    dayTotals: days,
     streak: streaks(activeDays),
     topDay: topDayEntry ? { date: topDayEntry[0], minutes: Math.round(topDayEntry[1] / 60000) } : null,
     byHour: hours,
@@ -243,6 +277,63 @@ export function listenerType(peakHour) {
   if (peakHour < 17) return { title: "Daytime devotee", blurb: "You listen most in the middle of the day." };
   if (peakHour < 21) return { title: "Evening regular", blurb: "After work is when you turn it up." };
   return { title: "Late-night listener", blurb: "The night is yours." };
+}
+
+// ---------------------------------------------------------------------------
+// Tempo
+
+export const TEMPO_BUCKETS = Array.from({ length: 14 }, (_, i) => 60 + i * 10); // 60..190, each 10 BPM wide
+
+/**
+ * entries: [{ id, name, artist, image, weight, plays, tempo? }]
+ * totalWeight: the whole period's weight (ms or rank points) so coverage reflects all listening.
+ */
+export function tempoSummary(entries, { minPlays = 1, totalWeight } = {}) {
+  const matched = entries.filter((e) => e.tempo > 0);
+  const weightOf = (list) => list.reduce((sum, e) => sum + (e.weight || 0), 0);
+  const matchedWeight = weightOf(matched);
+  const total = totalWeight || weightOf(entries);
+  if (!matched.length) return { avg: null, matchedCount: 0, total: entries.length, coverage: 0, histogram: [], fastest: null, slowest: null };
+
+  const avg = matched.reduce((sum, e) => sum + e.tempo * (e.weight || 0), 0) / (matchedWeight || 1);
+  let eligible = matched.filter((e) => e.plays >= minPlays);
+  if (eligible.length < 2) eligible = matched;
+  const fastest = eligible.reduce((a, b) => (b.tempo > a.tempo ? b : a));
+  const slowest = eligible.reduce((a, b) => (b.tempo < a.tempo ? b : a));
+
+  const histogram = TEMPO_BUCKETS.map((from) => ({ from, to: from + 10, weight: 0, count: 0 }));
+  for (const e of matched) {
+    const idx = Math.min(histogram.length - 1, Math.max(0, Math.floor((e.tempo - 60) / 10)));
+    histogram[idx].weight += e.weight || 0;
+    histogram[idx].count++;
+  }
+  return {
+    avg,
+    matchedCount: matched.length,
+    total: entries.length,
+    coverage: total ? matchedWeight / total : 0,
+    histogram,
+    fastest,
+    slowest,
+  };
+}
+
+// Play-weighted average tempo per calendar month inside the window.
+export function monthlyTempo(records, tempos, { start, end }) {
+  const acc = new Map();
+  for (const rec of records) {
+    if (rec.t > end) break;
+    if (rec.t < start || rec.type !== "music" || !rec.uri) continue;
+    const bpm = tempos.get(rec.uri.slice(14));
+    if (!bpm) continue;
+    const d = new Date(rec.t);
+    const key = `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
+    const a = acc.get(key) || [0, 0];
+    a[0] += bpm * rec.ms;
+    a[1] += rec.ms;
+    acc.set(key, a);
+  }
+  return [...acc.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([key, [sum, w]]) => ({ key, bpm: sum / w }));
 }
 
 // Weighted genre tally from decorated artists ({genres, ms}).
